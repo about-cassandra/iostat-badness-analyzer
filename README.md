@@ -43,7 +43,7 @@ This project consists of **one combined workflow**:
 - Low latency does **not** always mean healthy
 - High queue depth often predicts future problems
 - Raw numbers don’t explain *severity*
-- Humans need interpretation, not metrics
+- Humans need interpretation, not metrics 
 
 This tool:
 - Converts raw stats into a **single severity score**
@@ -57,8 +57,7 @@ This tool:
 
 | File | Purpose |
 |----|----|
-| `parse_iostat.py` | Parses raw iostat output into SQLite |
-| `iostat_report.py` | Reads SQLite and generates health report |
+| `iostat-badness-analyzer.py` | Combined parser and reporter |
 | `*.db` | SQLite database (generated) |
 | `*-badness.txt` | Final report output |
 
@@ -66,26 +65,38 @@ This tool:
 
 ## 🚀 Usage
 
-### Step 1 — Parse iostat output
+### Basic example - Parse and analyze immediately
+
 ```bash
-python3 parse_iostat.py -i iostat_output.txt
+# Generate iostat output
+iostat -x 2 3 > my-iostat.txt
+
+# Parse and generate report (combined command)
+python3 iostat-badness-analyzer.py all --input my-iostat.txt
+
+# Result files appear automatically:
+#   my-iostat.db (SQLite database)
+#   my-iostat-badness.txt (report)
 ```
 
-This creates:
-```
-iostat_output-iostat.db
-```
+### Separate steps - Parse first, then report later
 
----
-
-### Step 2 — Generate the report
 ```bash
-python3 iostat_report.py -i iostat_output-iostat.db
+# Step 1: Parse iostat to database
+python3 iostat-badness-analyzer.py parse --input iostat-output.txt
+
+# Step 2: Generate report from database
+python3 iostat-badness-analyzer.py report --database iostat-output.db
+
+# The report outputs to: iostat-output-badness.txt
 ```
 
-Output:
-```
-iostat_output-iostat-badness.txt
+### Generate report to custom file
+
+```bash
+python3 iostat-badness-analyzer.py report \
+  --database my-disk-data.db \
+  --report-output /reports/disk-health.txt
 ```
 
 ---
@@ -95,111 +106,20 @@ iostat_output-iostat-badness.txt
 ```
 time                 device  write_kB_s  write_await_ms  read_kB_s  read_await_ms  queue_size  badness_score  health     dominance
 -------------------  ------  -----------  --------------  ---------  -------------  ----------  -------------  ---------  -----------
-2025-02-12 17:25:30  sdb     2362.14      5.08            0.76       0.59           10.7        82             CRITICAL   queue-dominant
+2026-01-28 12:36:52  nvme0n1  4           24              0          0              0.01        36             DEGRADED  latency-dominant
+2026-01-28 12:37:00  dm-1     95.27       12.27           27.09      0.83           0.07        13             WARN      latency-dominant
 ```
-
----
-
-## 🧮 How the Badness Score Works (Simple Explanation)
-
-### Two things matter most for disk health:
-
-### 1️⃣ Latency (how long a request takes)
-Measured by:
-- `r_await`
-- `w_await`
-
-Think of this as:
-> “How long does one disk request take?”
-
----
-
-### 2️⃣ Queue Size (how many requests are waiting)
-Measured by:
-- `aqu-sz`
-
-Think of this as:
-> “How many people are waiting in line?”
-
----
-
-## 🧠 Simple Analogy (9th-Grade Level)
-
-Imagine a grocery store:
-
-| Metric | Meaning |
-|------|------|
-| Latency | How fast the cashier scans items |
-| Queue | How many people are waiting |
-| Badness | How bad the checkout experience is |
-
-### Examples:
-- Fast cashier + short line → ✅ good
-- Slow cashier + short line → ⚠️ slow
-- Fast cashier + long line → 🚨 overloaded
-- Slow cashier + long line → 🔥 disaster
-
----
-
-## 📐 Badness Score Formula
-
-### Latency penalty (L)
-
-```
-if latency ≤ 2 ms:           0
-if 2–10 ms:                  latency - 2
-if 10–40 ms:                 8 + 2 × (latency - 10)
-if > 40 ms:                  8 + 60 + 4 × (latency - 40)
-```
-
-### Queue penalty (Q)
-
-```
-if queue ≤ 4:                0
-if 4–8:                      3 × (queue - 4)
-if 8–16:                     12 + 5 × (queue - 8)
-if > 16:                     12 + 40 + 8 × (queue - 16)
-```
-
-### Final Score
-
-```
-Badness Score = L + Q
-```
-
----
-
-## 📊 Score Meaning
-
-| Score | Meaning |
-|------|--------|
-| 0–9 | OK |
-| 10–29 | WARN |
-| 30–59 | DEGRADED |
-| 60+ | CRITICAL |
-
----
-
-## 🧭 Dominance Label
-
-The tool also tells **what caused the problem**:
-
-| Label | Meaning |
-|------|--------|
-| `latency-dominant` | Disk is slow |
-| `queue-dominant` | Too many requests |
-| `balanced` | Both contribute |
 
 ---
 
 ## 🚨 Important Behavior
 
-✔ Ignores noise  
-✔ Ignores sub-5ms latency  
-✔ Highlights overload early  
-✔ Works for SSD / NVMe / HDD  
-✔ No dependencies  
-✔ Safe for automation  
+✔  Ignores noise  
+✔  Ignores sub-5ms latency  
+✔  Highlights overload early  
+✔  Works for SSD / NVMe / HDD  
+✔  No dependencies  
+✔  Safe for automation  
 
 ---
 
@@ -216,19 +136,56 @@ This tool catches:
 
 ## ✅ Summary
 
-✔ Easy to run  
-✔ Easy to understand  
-✔ Explains problems clearly  
-✔ Suitable for reports, tickets, or monitoring  
-✔ Designed for real-world operations  
+✔  Easy to run  
+✔  Easy to understand  
+✔  Explains problems clearly  
+✔  Suitable for reports, tickets, or monitoring  
+✔  Designed for real-world operations  
 
 ---
 
-If you want next:
-- CSV / JSON output
-- Trend graphs
-- Alert thresholds
-- Per-host summaries
-- Integration with Grafana
+## 💡 Example Command Sequence
 
-Just ask.
+```bash
+# Step 1: Get fresh iostat data
+iostat -x -c -d -t 1 5 > disk-check.txt
+
+# Step 2: Parse and analyze (everything in one command)
+python3 iostat-badness-analyzer.py all --input disk-check.txt
+
+# Step 3: Check the report
+less disk-check-badness.txt
+
+# Step 4: Send to monitoring or save for review
+./disk-check-badness.txt >> monthly_disk_reports/$(date +%Y-%m).txt
+```
+
+---
+
+## 🧭 Tips and Tricks
+
+### Multiple disks?
+Run once per disk or group:
+```bash
+iostat -x -d nvme0n1 2 3 > nvme-stats.txt
+```
+
+### Automate with cron
+```bash
+0 2 * * * iostat -x 2 3 > /var/log/iostat-daily.txt && \
+  python3 /opt/iostat-badness-analyzer.py all --input /var/log/iostat-daily.txt
+```
+
+### Compare two time periods
+```bash
+# Morning
+python3 iostat-badness-analyzer.py report --database before.db --report-output before.txt
+
+# Afternoon
+python3 iostat-badness-analyzer.py report --database after.db --report-output after.txt
+
+# Compare
+vimdiff before.txt after.txt
+```
+
+
