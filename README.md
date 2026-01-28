@@ -16,6 +16,7 @@ This project consists of **one combined workflow**:
    - Reads raw `iostat` text output
    - Extracts per-device metrics
    - Stores them in a SQLite database
+   - Streams input and batches inserts for large files (default batch size: 1000)
 
 2. **Analyze disk health**
    - Reads the SQLite database
@@ -187,5 +188,3 @@ python3 iostat-badness-analyzer.py report --database after.db --report-output af
 # Compare
 vimdiff before.txt after.txt
 ```
-
-

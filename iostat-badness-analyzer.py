@@ -51,9 +51,7 @@ from pathlib import Path
 from datetime import datetime
 
 
-# ========================================================================
-# PARSE MODULE - iostat text to SQLite
-# ========================================================================
+# === Parse module: iostat text to SQLite ==================================
 
 CANONICAL_ORDER = [
     "device",
@@ -145,9 +143,7 @@ SECTOR_SIZE_BYTES = 512.0
 KIB_BYTES = 1024.0
 
 
-# ========================================================================
-# Report Module - Generate Badness Report from SQLite
-# ========================================================================
+# === Report module: badness report from SQLite =============================
 
 REPORT_QUERY = """
 WITH scored AS (
@@ -274,9 +270,7 @@ def format_table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> str:
     return "\n".join(out) + "\n"
 
 
-# ========================================================================
-# PARSING HELPERS (from parse_iostat_to_sqlite.py)
-# ========================================================================
+# === Parsing helpers =======================================================
 
 def _to_float(s: str) -> Optional[float]:
     s = s.strip()
@@ -397,9 +391,8 @@ def _split_device_sections(lines: Iterable[str]) -> List[Tuple[int, Optional[str
     return sections
 
 
-def parse_iostat_text(text: str) -> List[IostatRecord]:
-    records: List[IostatRecord] = []
-    sections = _split_device_sections(text.splitlines())
+def parse_iostat_lines(lines: Iterable[str]) -> Iterable[IostatRecord]:
+    sections = _split_device_sections(lines)
 
     for sample_id, sample_ts, header_tokens, rows in sections:
         header_map = _normalize_header_tokens(header_tokens)
@@ -434,18 +427,18 @@ def parse_iostat_text(text: str) -> List[IostatRecord]:
 
                 metrics[canon_key] = v
 
-            records.append(
-                IostatRecord(
-                    sample_id=sample_id,
-                    sample_ts=sample_ts,
-                    device=device,
-                    metrics=metrics,
-                    raw_columns=raw_cols,
-                    header_fingerprint=fingerprint,
-                )
+            yield IostatRecord(
+                sample_id=sample_id,
+                sample_ts=sample_ts,
+                device=device,
+                metrics=metrics,
+                raw_columns=raw_cols,
+                header_fingerprint=fingerprint,
             )
 
-    return records
+
+def parse_iostat_text(text: str) -> List[IostatRecord]:
+    return list(parse_iostat_lines(text.splitlines()))
 
 
 # SQLite output
@@ -485,41 +478,73 @@ def derive_output_db_path(input_path: Path) -> Path:
     return input_path.with_name(out_name)
 
 
-def write_records_to_sqlite(db_path: Path, source_file: str, records: List[IostatRecord]) -> None:
+def write_records_to_sqlite(
+    db_path: Path,
+    source_file: str,
+    records: Iterable[IostatRecord],
+    batch_size: int = 1000,
+) -> int:
+    """Write records in batches; returns rows written."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(str(db_path))
-    try:
+    insert_sql = """
+        INSERT INTO iostat_device_rows
+          (source_file, sample_id, sample_ts, header_fingerprint, device, metrics_json, raw_columns_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """
+
+    def record_values(batch: Iterable[IostatRecord]) -> List[Tuple[str, int, Optional[str], str, str, str, str]]:
+        return [
+            (
+                source_file,
+                r.sample_id,
+                r.sample_ts,
+                r.header_fingerprint,
+                r.device,
+                json.dumps(r.metrics, sort_keys=True),
+                json.dumps(r.raw_columns, sort_keys=True),
+            )
+            for r in batch
+        ]
+
+    total = 0
+    with sqlite3.connect(str(db_path)) as conn:
         conn.executescript(SCHEMA_SQL)
-
         cur = conn.cursor()
-        cur.executemany(
-            """
-            INSERT INTO iostat_device_rows
-              (source_file, sample_id, sample_ts, header_fingerprint, device, metrics_json, raw_columns_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    source_file,
-                    r.sample_id,
-                    r.sample_ts,
-                    r.header_fingerprint,
-                    r.device,
-                    json.dumps(r.metrics, sort_keys=True),
-                    json.dumps(r.raw_columns, sort_keys=True),
-                )
-                for r in records
-            ],
-        )
+        batch: List[IostatRecord] = []
+        for record in records:
+            batch.append(record)
+            if len(batch) >= batch_size:
+                cur.executemany(insert_sql, record_values(batch))
+                total += len(batch)
+                batch.clear()
+        if batch:
+            cur.executemany(insert_sql, record_values(batch))
+            total += len(batch)
         conn.commit()
-    finally:
-        conn.close()
+
+    return total
 
 
-# ========================================================================
-# MAIN COMMAND LINE INTERFACE
-# ========================================================================
+# === CLI ===================================================================
+
+def parse_iostat_file(in_path: Path, out_db: Path) -> int:
+    with in_path.open("r", encoding="utf-8", errors="replace") as handle:
+        records = parse_iostat_lines(handle)
+        return write_records_to_sqlite(out_db, source_file=str(in_path), records=records)
+
+
+def generate_report(db_path: Path, out_path: Path) -> int:
+    with sqlite3.connect(str(db_path)) as conn:
+        cur = conn.cursor()
+        cur.execute(REPORT_QUERY)
+        rows = cur.fetchall()
+        headers = [d[0] for d in cur.description]
+
+    report = format_table(headers, rows)
+    out_path.write_text(report, encoding="utf-8")
+    return len(rows)
+
 
 def parse_command(args: argparse.Namespace) -> int:
     """Parse iostat files and create SQLite database."""
@@ -532,16 +557,13 @@ def parse_command(args: argparse.Namespace) -> int:
     else:
         out_db = derive_output_db_path(in_path)
 
-    text = in_path.read_text(errors="replace")
-    records = parse_iostat_text(text)
-
-    write_records_to_sqlite(out_db, source_file=str(in_path), records=records)
+    rows_written = parse_iostat_file(in_path, out_db)
 
     print(json.dumps({
         "action": "parse",
         "input": str(in_path),
         "output_db": str(out_db),
-        "rows_written": len(records)
+        "rows_written": rows_written
     }))
     return 0
 
@@ -557,21 +579,11 @@ def report_command(args: argparse.Namespace) -> int:
     else:
         out_path = db_path.with_name(f"{db_path.stem}-badness.txt")
 
-    conn = sqlite3.connect(str(db_path))
-    try:
-        cur = conn.cursor()
-        cur.execute(REPORT_QUERY)
-        rows = cur.fetchall()
-        headers = [d[0] for d in cur.description]
+    rows = generate_report(db_path, out_path)
 
-        report = format_table(headers, rows)
-        out_path.write_text(report, encoding="utf-8")
-
-        print(f"Report generated: {out_path}")
-        print(f"Total rows: {len(rows)}")
-        return 0
-    finally:
-        conn.close()
+    print(f"Report generated: {out_path}")
+    print(f"Total rows: {rows}")
+    return 0
 
 
 def main() -> int:
@@ -628,27 +640,16 @@ Examples:
         elif args.command == 'report':
             return report_command(args)
         elif args.command == 'all':
-            # First parse
-            parse_args = argparse.Namespace(
-                input=args.input,
-                output=args.db_output
+            db_path = Path(args.db_output).expanduser().resolve() if args.db_output else derive_output_db_path(
+                Path(args.input).expanduser().resolve()
             )
-            parse_ret = parse_command(parse_args)
-            if parse_ret != 0:
-                return parse_ret
-            
-            # Then generate report
-            db_path = Path(args.input).expanduser().resolve()
-            if args.db_output:
-                db_path = Path(args.db_output)
-            else:
-                db_path = derive_output_db_path(db_path)
-            
-            report_args = argparse.Namespace(
-                database=str(db_path),
-                report_output=args.report_output
+            parse_iostat_file(Path(args.input).expanduser().resolve(), db_path)
+            report_path = Path(args.report_output).expanduser().resolve() if args.report_output else db_path.with_name(
+                f"{db_path.stem}-badness.txt"
             )
-            return report_command(report_args)
+            generate_report(db_path, report_path)
+            print(f"Report generated: {report_path}")
+            return 0
     
     except SystemExit as e:
         return e.code
