@@ -144,6 +144,36 @@ BASIC_MB_HEADERS = {
 SECTOR_SIZE_BYTES = 512.0
 KIB_BYTES = 1024.0
 
+# Unit conversion mapping
+# Maps (original_header, canonical_header) to multiplication factor
+# Creates a centralized, maintainable conversion strategy
+UNIT_CONVERSION_MAP: Dict[Tuple[str, str], float] = {
+    # Basic MB -> kB conversions
+    ("MB_read/s", "kB_read/s"): 1024.0,
+    ("MB_wrtn/s", "kB_wrtn/s"): 1024.0,
+    ("MB_dscd/s", "kB_dscd/s"): 1024.0,
+    ("MB_w+d/s", "kB_w+d/s"): 1024.0,
+    
+    ("MB_read", "kB_read"): 1024.0,
+    ("MB_wrtn", "kB_wrtn"): 1024.0,
+    ("MB_dscd", "kB_dscd"): 1024.0,
+    ("MB_w+d", "kB_w+d"): 1024.0,
+    
+    # MB throughput -> kB/s conversions
+    ("rMB/s", "rkB/s"): 1024.0,
+    ("wMB/s", "wkB/s"): 1024.0,
+    ("dMB/s", "dkB/s"): 1024.0,
+    ("rsec/s", "rkB/s"): SECTOR_SIZE_BYTES / KIB_BYTES,
+    ("wsec/s", "wkB/s"): SECTOR_SIZE_BYTES / KIB_BYTES,
+    ("dsec/s", "dkB/s"): SECTOR_SIZE_BYTES / KIB_BYTES,
+    
+    # Average request size -> kB conversions
+    ("avgrq-sz", "areq-sz"): SECTOR_SIZE_BYTES / KIB_BYTES,
+    ("rareq-sz", "areq-sz"): SECTOR_SIZE_BYTES / KIB_BYTES,
+    ("wareq-sz", "areq-sz"): SECTOR_SIZE_BYTES / KIB_BYTES,
+    ("dareq-sz", "areq-sz"): SECTOR_SIZE_BYTES / KIB_BYTES,
+}
+
 
 # ========================================================================
 # Report Module - Generate Badness Report from SQLite
@@ -289,20 +319,14 @@ def _to_float(s: str) -> Optional[float]:
 
 
 def _convert_value(original_header: str, canonical_header: str, value: Optional[float]) -> Optional[float]:
+    """Apply unit conversions using centralized mapping. Returns None for None values."""
     if value is None:
         return None
 
-    if original_header in BASIC_MB_HEADERS and canonical_header.startswith("kB_"):
-        return value * 1024.0
-
-    if original_header in THROUGHPUT_MB_HEADERS and canonical_header in {"rkB/s", "wkB/s", "dkB/s"}:
-        return value * 1024.0
-
-    if original_header in SECTOR_RATE_HEADERS and canonical_header in {"rkB/s", "wkB/s", "dkB/s"}:
-        return value * SECTOR_SIZE_BYTES / KIB_BYTES
-
-    if original_header == "avgrq-sz" and canonical_header == "areq-sz":
-        return value * SECTOR_SIZE_BYTES / KIB_BYTES
+    # Check if there's a specific conversion for this (original, canonical) pair
+    key: Tuple[str, str] = (original_header, canonical_header)
+    if key in UNIT_CONVERSION_MAP:
+        return value * UNIT_CONVERSION_MAP[key]
 
     return value
 
@@ -338,8 +362,26 @@ class IostatRecord:
     header_fingerprint: str
 
 
-def _normalize_header_tokens(header_tokens: List[str]) -> List[Tuple[str, str]]:
-    return [(tok, ALIASES.get(tok, tok)) for tok in header_tokens]
+def _normalize_header_tokens(header_tokens: List[str]) -> List[Tuple[str, str, str]]:
+    """Returns list of (original, canonical, canonical_key) tuples, handling duplicates."""
+    seen: Dict[str, int] = {}
+    result = []
+    
+    for orig in header_tokens:
+        canon = ALIASES.get(orig, orig)
+        
+        if canon == "device":
+            canonical_key = "device"
+        elif canon in seen:
+            seen[canon] += 1
+            canonical_key = f"{canon}__dup{seen[canon]}"
+        else:
+            seen[canon] = 1
+            canonical_key = canon
+            
+        result.append((orig, canon, canonical_key))
+    
+    return result
 
 
 def _split_device_sections(lines: Iterable[str]) -> List[Tuple[int, Optional[str], List[str], List[List[str]]]]:
@@ -403,8 +445,9 @@ def parse_iostat_text(text: str) -> List[IostatRecord]:
 
     for sample_id, sample_ts, header_tokens, rows in sections:
         header_map = _normalize_header_tokens(header_tokens)
-        orig_by_idx = [o for (o, _c) in header_map]
-        canon_by_idx = [c for (_o, c) in header_map]
+        orig_by_idx = [o for (o, _c, _ck) in header_map]
+        canon_by_idx = [c for (_o, c, _ck) in header_map]
+        cannonical_key_by_idx = [ck for (_o, _c, ck) in header_map]
         fingerprint = "|".join(header_tokens)
 
         for row in rows:
@@ -412,11 +455,10 @@ def parse_iostat_text(text: str) -> List[IostatRecord]:
             raw_cols: Dict[str, str] = {}
             metrics: Dict[str, Optional[float]] = {}
 
-            seen: Dict[str, int] = {}
-
             for i, raw_val in enumerate(row):
                 orig = orig_by_idx[i]
                 canon = canon_by_idx[i]
+                canon_key = cannonical_key_by_idx[i]
                 raw_cols[orig] = raw_val
 
                 if canon == "device":
@@ -424,13 +466,6 @@ def parse_iostat_text(text: str) -> List[IostatRecord]:
 
                 v = _to_float(raw_val)
                 v = _convert_value(orig, canon, v)
-
-                if canon in seen:
-                    seen[canon] += 1
-                    canon_key = f"{canon}__dup{seen[canon]}"
-                else:
-                    seen[canon] = 1
-                    canon_key = canon
 
                 metrics[canon_key] = v
 
@@ -488,33 +523,30 @@ def derive_output_db_path(input_path: Path) -> Path:
 def write_records_to_sqlite(db_path: Path, source_file: str, records: List[IostatRecord]) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.executescript(SCHEMA_SQL)
+    conn_data = [
+        (
+            source_file,
+            r.sample_id,
+            r.sample_ts,
+            r.header_fingerprint,
+            r.device,
+            json.dumps(r.metrics, sort_keys=True),
+            json.dumps(r.raw_columns, sort_keys=True),
+        )
+        for r in records
+    ]
 
-        cur = conn.cursor()
-        cur.executemany(
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript(SCHEMA_SQL)
+        conn.executemany(
             """
             INSERT INTO iostat_device_rows
               (source_file, sample_id, sample_ts, header_fingerprint, device, metrics_json, raw_columns_json)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            [
-                (
-                    source_file,
-                    r.sample_id,
-                    r.sample_ts,
-                    r.header_fingerprint,
-                    r.device,
-                    json.dumps(r.metrics, sort_keys=True),
-                    json.dumps(r.raw_columns, sort_keys=True),
-                )
-                for r in records
-            ],
+            conn_data,
         )
         conn.commit()
-    finally:
-        conn.close()
 
 
 # ========================================================================
@@ -557,8 +589,7 @@ def report_command(args: argparse.Namespace) -> int:
     else:
         out_path = db_path.with_name(f"{db_path.stem}-badness.txt")
 
-    conn = sqlite3.connect(str(db_path))
-    try:
+    with sqlite3.connect(str(db_path)) as conn:
         cur = conn.cursor()
         cur.execute(REPORT_QUERY)
         rows = cur.fetchall()
@@ -570,8 +601,6 @@ def report_command(args: argparse.Namespace) -> int:
         print(f"Report generated: {out_path}")
         print(f"Total rows: {len(rows)}")
         return 0
-    finally:
-        conn.close()
 
 
 def main() -> int:
