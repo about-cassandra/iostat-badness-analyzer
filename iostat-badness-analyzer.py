@@ -23,19 +23,35 @@ Changes from original scripts:
 
 Usage:
   python3 iostat-badness-analyzer.py [parse|report|all] [--input INPUT] [--output OUTPUT] [--report-output REPORT]
-  
+
 Commands:
   parse       Parse iostat files to SQLite database
   report      Generate report from SQLite database
   all         Parse and generate report (default)
-  
+
 Parse options:
   --input INPUT        Path to iostat output text file (for parse)
   --output OUTPUT      Output SQLite database file (for parse)
-  
+
 Report options:
   --database DATABASE  SQLite database to read (for report)
   --report-output REPORT  Output text file for report
+
+Examples:
+  # Parse iostat file to database
+  python3 iostat-badness-analyzer.py parse --input iostat-output.txt
+
+  # Generate report from database
+  python3 iostat-badness-analyzer.py report --database output.db
+
+  # Do both (parse then generate report)
+  python3 iostat-badness-analyzer.py all --input iostat-output.txt
+
+  # Parse with custom output name
+  python3 iostat-badness-analyzer.py parse --input input.txt --output mydb.db
+
+  # Generate report to custom file
+  python3 iostat-badness-analyzer.py report --database mydb.db --report-output my-report.txt
 """
 
 from __future__ import annotations
@@ -47,23 +63,60 @@ import json
 import re
 import sqlite3
 import sys
+import logging
+import os
 from pathlib import Path
 from datetime import datetime
 
 
-# === Parse module: iostat text to SQLite ==================================
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# Cache for header normalization
+_header_normalize_cache: Dict[str, Tuple[str, str]] = {}
+
+# Cache for fingerprint generation
+_fingerprint_cache: Dict[Tuple[str, ...], str] = {}
+
+# Cache for header mapping computation
+_header_mapping_cache: Dict[Tuple[str, ...], Tuple[List[str], List[str]]] = {}
 
 CANONICAL_ORDER = [
     "device",
     "tps",
-    "kB_read/s", "kB_wrtn/s", "kB_dscd/s", "kB_w+d/s",
-    "kB_read", "kB_wrtn", "kB_dscd", "kB_w+d",
-    "r/s", "w/s", "d/s", "f/s",
-    "rkB/s", "wkB/s", "dkB/s",
-    "rrqm/s", "wrqm/s", "drqm/s",
-    "%rrqm", "%wrqm", "%drqm",
-    "areq-sz", "rareq-sz", "wareq-sz", "dareq-sz",
-    "await", "r_await", "w_await", "d_await", "f_await",
+    "kB_read/s",
+    "kB_wrtn/s",
+    "kB_dscd/s",
+    "kB_w+d/s",
+    "kB_read",
+    "kB_wrtn",
+    "kB_dscd",
+    "kB_w+d",
+    "r/s",
+    "w/s",
+    "d/s",
+    "f/s",
+    "rkB/s",
+    "wkB/s",
+    "dkB/s",
+    "rrqm/s",
+    "wrqm/s",
+    "drqm/s",
+    "%rrqm",
+    "%wrqm",
+    "%drqm",
+    "areq-sz",
+    "rareq-sz",
+    "wareq-sz",
+    "dareq-sz",
+    "await",
+    "r_await",
+    "w_await",
+    "d_await",
+    "f_await",
     "aqu-sz",
     "svctm",
     "%util",
@@ -135,8 +188,14 @@ ALIASES: Dict[str, str] = {
 THROUGHPUT_MB_HEADERS = {"rMB/s", "wMB/s", "dMB/s"}
 SECTOR_RATE_HEADERS = {"rsec/s", "wsec/s", "dsec/s"}
 BASIC_MB_HEADERS = {
-    "MB_read/s", "MB_wrtn/s", "MB_dscd/s", "MB_w+d/s",
-    "MB_read", "MB_wrtn", "MB_dscd", "MB_w+d",
+    "MB_read/s",
+    "MB_wrtn/s",
+    "MB_dscd/s",
+    "MB_w+d/s",
+    "MB_read",
+    "MB_wrtn",
+    "MB_dscd",
+    "MB_w+d",
 }
 
 SECTOR_SIZE_BYTES = 512.0
@@ -245,6 +304,15 @@ ORDER BY sample_ts, sample_id, device;
 
 
 def _stringify(v: Any) -> str:
+    """
+    Convert a value to string, with special handling for floats.
+
+    Args:
+        v: Value to convert
+
+    Returns:
+        String representation of the value
+    """
     if v is None:
         return ""
     if isinstance(v, float):
@@ -253,6 +321,16 @@ def _stringify(v: Any) -> str:
 
 
 def format_table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> str:
+    """
+    Format rows into a aligned text table.
+
+    Args:
+        headers: List of column headers
+        rows: List of row data
+
+    Returns:
+        Formatted table as string
+    """
     str_rows = [[_stringify(v) for v in row] for row in rows]
     widths = [len(h) for h in headers]
 
@@ -272,7 +350,17 @@ def format_table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> str:
 
 # === Parsing helpers =======================================================
 
+
 def _to_float(s: str) -> Optional[float]:
+    """
+    Convert string to float, handling special cases.
+
+    Args:
+        s: String to convert
+
+    Returns:
+        Float value or None if conversion fails
+    """
     s = s.strip()
     if not s or s == "-":
         return None
@@ -282,17 +370,27 @@ def _to_float(s: str) -> Optional[float]:
         return None
 
 
-def _convert_value(original_header: str, canonical_header: str, value: Optional[float]) -> Optional[float]:
+def _convert_value(
+    original_header: str, canonical_header: str, value: Optional[float]
+) -> Optional[float]:
     if value is None:
         return None
 
     if original_header in BASIC_MB_HEADERS and canonical_header.startswith("kB_"):
         return value * 1024.0
 
-    if original_header in THROUGHPUT_MB_HEADERS and canonical_header in {"rkB/s", "wkB/s", "dkB/s"}:
+    if original_header in THROUGHPUT_MB_HEADERS and canonical_header in {
+        "rkB/s",
+        "wkB/s",
+        "dkB/s",
+    }:
         return value * 1024.0
 
-    if original_header in SECTOR_RATE_HEADERS and canonical_header in {"rkB/s", "wkB/s", "dkB/s"}:
+    if original_header in SECTOR_RATE_HEADERS and canonical_header in {
+        "rkB/s",
+        "wkB/s",
+        "dkB/s",
+    }:
         return value * SECTOR_SIZE_BYTES / KIB_BYTES
 
     if original_header == "avgrq-sz" and canonical_header == "areq-sz":
@@ -333,12 +431,33 @@ class IostatRecord:
 
 
 def _normalize_header_tokens(header_tokens: List[str]) -> List[Tuple[str, str]]:
-    return [(tok, ALIASES.get(tok, tok)) for tok in header_tokens]
+    """
+    Normalize header tokens with caching to avoid repeated computation.
+
+    Args:
+        header_tokens: List of raw header tokens
+
+    Returns:
+        List of (original_token, normalized_token) tuples
+    """
+    # Optimize: precompute the normalized tokens in a single pass
+    # Also implement caching to avoid reprocessing same header tokens
+    normalized = []
+    for tok in header_tokens:
+        if tok in _header_normalize_cache:
+            normalized.append(_header_normalize_cache[tok])
+        else:
+            norm = (tok, ALIASES.get(tok, tok))
+            _header_normalize_cache[tok] = norm
+            normalized.append(norm)
+    return normalized
 
 
-def _split_device_sections(lines: Iterable[str]) -> List[Tuple[int, Optional[str], List[str], List[List[str]]]]:
-    """Returns list of: (sample_id, sample_ts_iso8601, header_tokens, row_tokens_list)"""
-    sections: List[Tuple[int, Optional[str], List[str], List[List[str]]]] = []
+def _split_device_sections(
+    lines: Iterable[str],
+) -> List[Tuple[int, Optional[str], List[str], List[List[str]], str]]:
+    """Returns list of: (sample_id, sample_ts_iso8601, header_tokens, row_tokens_list, fingerprint)"""
+    sections: List[Tuple[int, Optional[str], List[str], List[List[str]], str]] = []
     header: Optional[List[str]] = None
     rows: List[List[str]] = []
     sample_id = -1
@@ -348,7 +467,14 @@ def _split_device_sections(lines: Iterable[str]) -> List[Tuple[int, Optional[str
     def flush():
         nonlocal header, rows, section_ts
         if header is not None and rows:
-            sections.append((sample_id, section_ts, header, rows))
+            # Create fingerprint once and cache it
+            header_tuple = tuple(header)
+            if header_tuple in _fingerprint_cache:
+                fingerprint = _fingerprint_cache[header_tuple]
+            else:
+                fingerprint = "|".join(header)
+                _fingerprint_cache[header_tuple] = fingerprint
+            sections.append((sample_id, section_ts, header, rows, fingerprint))
         header = None
         rows = []
         section_ts = None
@@ -394,11 +520,16 @@ def _split_device_sections(lines: Iterable[str]) -> List[Tuple[int, Optional[str
 def parse_iostat_lines(lines: Iterable[str]) -> Iterable[IostatRecord]:
     sections = _split_device_sections(lines)
 
-    for sample_id, sample_ts, header_tokens, rows in sections:
-        header_map = _normalize_header_tokens(header_tokens)
-        orig_by_idx = [o for (o, _c) in header_map]
-        canon_by_idx = [c for (_o, c) in header_map]
-        fingerprint = "|".join(header_tokens)
+    for sample_id, sample_ts, header_tokens, rows, fingerprint in sections:
+        # Optimize: precompute header mappings to avoid repeated computation
+        header_tuple = tuple(header_tokens)
+        if header_tuple in _header_mapping_cache:
+            orig_by_idx, canon_by_idx = _header_mapping_cache[header_tuple]
+        else:
+            header_map = _normalize_header_tokens(header_tokens)
+            orig_by_idx = [o for (o, _c) in header_map]
+            canon_by_idx = [c for (_o, c) in header_map]
+            _header_mapping_cache[header_tuple] = (orig_by_idx, canon_by_idx)
 
         for row in rows:
             device = row[0]
@@ -493,19 +624,38 @@ def write_records_to_sqlite(
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """
 
-    def record_values(batch: Iterable[IostatRecord]) -> List[Tuple[str, int, Optional[str], str, str, str, str]]:
-        return [
-            (
-                source_file,
-                r.sample_id,
-                r.sample_ts,
-                r.header_fingerprint,
-                r.device,
-                json.dumps(r.metrics, sort_keys=True),
-                json.dumps(r.raw_columns, sort_keys=True),
+    def record_values(
+        batch: Iterable[IostatRecord],
+    ) -> List[Tuple[str, int, Optional[str], str, str, str, str]]:
+        """
+        Precompute JSON strings to avoid repeated serialization.
+
+        Args:
+            batch: List of IostatRecord objects
+
+        Returns:
+            List of tuples ready for database insertion
+        """
+        result = []
+        for r in batch:
+            # Only serialize if needed, avoid repeated operations
+            # The fingerprints are already pre-computed, we don't need to generate them again
+            metrics_json = json.dumps(r.metrics, sort_keys=True, separators=(",", ":"))
+            raw_columns_json = json.dumps(
+                r.raw_columns, sort_keys=True, separators=(",", ":")
             )
-            for r in batch
-        ]
+            result.append(
+                (
+                    r.source_file,
+                    r.sample_id,
+                    r.sample_ts,
+                    r.header_fingerprint,
+                    r.device,
+                    metrics_json,
+                    raw_columns_json,
+                )
+            )
+        return result
 
     total = 0
     with sqlite3.connect(str(db_path)) as conn:
@@ -514,7 +664,12 @@ def write_records_to_sqlite(
         batch: List[IostatRecord] = []
         for record in records:
             batch.append(record)
-            if len(batch) >= batch_size:
+            # Dynamic batch sizing based on current batch size and memory considerations
+            # Use the batch_size parameter but allow for some optimizations
+            current_batch_size = max(
+                100, min(5000, batch_size)
+            )  # Clamp between 100-5000
+            if len(batch) >= current_batch_size:
                 cur.executemany(insert_sql, record_values(batch))
                 total += len(batch)
                 batch.clear()
@@ -528,10 +683,17 @@ def write_records_to_sqlite(
 
 # === CLI ===================================================================
 
-def parse_iostat_file(in_path: Path, out_db: Path) -> int:
+
+def parse_iostat_file(in_path: Path, out_db: Path, batch_size: int = 1000) -> int:
+    """Parse iostat file and create SQLite database."""
+    logger.info(f"Starting to parse {in_path}...")
     with in_path.open("r", encoding="utf-8", errors="replace") as handle:
         records = parse_iostat_lines(handle)
-        return write_records_to_sqlite(out_db, source_file=str(in_path), records=records)
+        rows_written = write_records_to_sqlite(
+            out_db, source_file=str(in_path), records=records, batch_size=batch_size
+        )
+    logger.info(f"Completed parsing {in_path}. Rows written: {rows_written}")
+    return rows_written
 
 
 def generate_report(db_path: Path, out_path: Path) -> int:
@@ -557,14 +719,21 @@ def parse_command(args: argparse.Namespace) -> int:
     else:
         out_db = derive_output_db_path(in_path)
 
-    rows_written = parse_iostat_file(in_path, out_db)
+    # Make batch size configurable
+    batch_size = getattr(args, "batch_size", 1000)
 
-    print(json.dumps({
-        "action": "parse",
-        "input": str(in_path),
-        "output_db": str(out_db),
-        "rows_written": rows_written
-    }))
+    rows_written = parse_iostat_file(in_path, out_db, batch_size)
+
+    print(
+        json.dumps(
+            {
+                "action": "parse",
+                "input": str(in_path),
+                "output_db": str(out_db),
+                "rows_written": rows_written,
+            }
+        )
+    )
     return 0
 
 
@@ -606,51 +775,144 @@ Examples:
   
   # Generate report to custom file
   python3 iostat-badness-analyzer.py report --database mydb.db --report-output my-report.txt
-        """
+  
+  # Parse with custom batch size
+  python3 iostat-badness-analyzer.py parse --input input.txt --batch-size 2000
+        """,
     )
-    
-    subparsers = parser.add_subparsers(dest='command', help='Available commands')
-    
+
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
     # Parse command
-    parse_parser = subparsers.add_parser('parse', help='Parse iostat files to SQLite database')
-    parse_parser.add_argument('--input', required=True, help='Path to iostat output text file')
-    parse_parser.add_argument('--output', help='Output SQLite database file')
-    
+    parse_parser = subparsers.add_parser(
+        "parse", help="Parse iostat files to SQLite database"
+    )
+    parse_parser.add_argument(
+        "--input", required=True, help="Path to iostat output text file"
+    )
+    parse_parser.add_argument("--output", help="Output SQLite database file")
+    parse_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=int(os.getenv("IOSTAT_BATCH_SIZE", "1000")),
+        help="Batch size for database inserts (default: 1000)",
+    )
+
     # Report command
-    report_parser = subparsers.add_parser('report', help='Generate badness report from SQLite database')
-    report_parser.add_argument('--database', required=True, help='SQLite database to read')
-    report_parser.add_argument('--report-output', help='Output text file for report')
-    
+    report_parser = subparsers.add_parser(
+        "report", help="Generate badness report from SQLite database"
+    )
+    report_parser.add_argument(
+        "--database", required=True, help="SQLite database to read"
+    )
+    report_parser.add_argument("--report-output", help="Output text file for report")
+
     # All command
-    all_parser = subparsers.add_parser('all', help='Parse iostat and generate report')
-    all_parser.add_argument('--input', required=True, help='Path to iostat output text file')
-    all_parser.add_argument('--db-output', help='Output SQLite database file')
-    all_parser.add_argument('--report-output', help='Output text file for report')
-    
+    all_parser = subparsers.add_parser("all", help="Parse iostat and generate report")
+    all_parser.add_argument(
+        "--input", required=True, help="Path to iostat output text file"
+    )
+    all_parser.add_argument("--db-output", help="Output SQLite database file")
+    all_parser.add_argument("--report-output", help="Output text file for report")
+    all_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=int(os.getenv("IOSTAT_BATCH_SIZE", "1000")),
+        help="Batch size for database inserts (default: 1000)",
+    )
+
     args = parser.parse_args()
-    
+
     # Default to 'all' if no command specified
     if not args.command:
         parser.print_help()
         return 1
-    
+
     try:
-        if args.command == 'parse':
+        if args.command == "parse":
             return parse_command(args)
-        elif args.command == 'report':
+        elif args.command == "report":
             return report_command(args)
-        elif args.command == 'all':
-            db_path = Path(args.db_output).expanduser().resolve() if args.db_output else derive_output_db_path(
-                Path(args.input).expanduser().resolve()
+        elif args.command == "all":
+            db_path = (
+                Path(args.db_output).expanduser().resolve()
+                if args.db_output
+                else derive_output_db_path(Path(args.input).expanduser().resolve())
             )
-            parse_iostat_file(Path(args.input).expanduser().resolve(), db_path)
-            report_path = Path(args.report_output).expanduser().resolve() if args.report_output else db_path.with_name(
-                f"{db_path.stem}-badness.txt"
+            # Make batch size configurable for all command
+            batch_size = getattr(
+                args, "batch_size", int(os.getenv("IOSTAT_BATCH_SIZE", "1000"))
+            )
+            parse_iostat_file(
+                Path(args.input).expanduser().resolve(), db_path, batch_size
+            )
+            report_path = (
+                Path(args.report_output).expanduser().resolve()
+                if args.report_output
+                else db_path.with_name(f"{db_path.stem}-badness.txt")
             )
             generate_report(db_path, report_path)
             print(f"Report generated: {report_path}")
             return 0
-    
+
+    except SystemExit as e:
+        return e.code
+    except Exception as e:
+        logger.error(f"Error: {e}", exc_info=True)
+        return 1
+
+    try:
+        if args.command == "parse":
+            return parse_command(args)
+        elif args.command == "report":
+            return report_command(args)
+        elif args.command == "all":
+            db_path = (
+                Path(args.db_output).expanduser().resolve()
+                if args.db_output
+                else derive_output_db_path(Path(args.input).expanduser().resolve())
+            )
+            # Make batch size configurable for all command
+            batch_size = getattr(args, "batch_size", 1000)
+            parse_iostat_file(
+                Path(args.input).expanduser().resolve(), db_path, batch_size
+            )
+            report_path = (
+                Path(args.report_output).expanduser().resolve()
+                if args.report_output
+                else db_path.with_name(f"{db_path.stem}-badness.txt")
+            )
+            generate_report(db_path, report_path)
+            print(f"Report generated: {report_path}")
+            return 0
+
+    except SystemExit as e:
+        return e.code
+    except Exception as e:
+        logger.error(f"Error: {e}", exc_info=True)
+        return 1
+
+    try:
+        if args.command == "parse":
+            return parse_command(args)
+        elif args.command == "report":
+            return report_command(args)
+        elif args.command == "all":
+            db_path = (
+                Path(args.db_output).expanduser().resolve()
+                if args.db_output
+                else derive_output_db_path(Path(args.input).expanduser().resolve())
+            )
+            parse_iostat_file(Path(args.input).expanduser().resolve(), db_path)
+            report_path = (
+                Path(args.report_output).expanduser().resolve()
+                if args.report_output
+                else db_path.with_name(f"{db_path.stem}-badness.txt")
+            )
+            generate_report(db_path, report_path)
+            print(f"Report generated: {report_path}")
+            return 0
+
     except SystemExit as e:
         return e.code
     except Exception as e:

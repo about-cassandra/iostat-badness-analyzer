@@ -1,50 +1,42 @@
 # iostat Badness Analyzer
 
-This project analyzes **Linux `iostat` output** and produces a **human-readable disk health report** based on latency and queue depth.
+Analyzes Linux `iostat` output to produce human-readable disk health reports based on latency and queue depth.
 
-It is designed to answer one question clearly:
-
-> **“Is this disk slow, overloaded, or healthy?”**
+Answers the question: **"Is this disk slow, overloaded, or healthy?"**
 
 ---
 
-## 📦 What This Project Does
+## What This Project Does
 
-This project consists of **one combined workflow**:
+This project consists of one combined workflow:
 
-1. **Parse iostat output**
-   - Reads raw `iostat` text output
-   - Extracts per-device metrics
-   - Stores them in a SQLite database
-   - Streams input and batches inserts for large files (default batch size: 1000)
+- **Parse iostat output**
+  - Reads raw `iostat` text output
+  - Extracts per-device metrics
+  - Stores them in a SQLite database
+  - Streams input and batches inserts for large files (default batch size: 1000)
 
-2. **Analyze disk health**
-   - Reads the SQLite database
-   - Calculates a **Badness Score**
-   - Classifies issues as:
-     - `OK`
-     - `WARN`
-     - `DEGRADED`
-     - `CRITICAL`
-   - Labels whether problems are:
-     - **latency-dominant**
-     - **queue-dominant**
+- **Analyze disk health**
+  - Reads the SQLite database
+  - Calculates a **Badness Score**
+  - Classifies issues as: OK, WARN, DEGRADED, CRITICAL
+  - Labels whether problems are: latency-dominant or queue-dominant
 
-3. **Outputs a clean text report**
-   - Easy to read
-   - Fixed-width columns
-   - Ready for email, tickets, or review
+- **Output a clean text report**
+  - Easy to read
+  - Fixed-width columns
+  - Ready for email, tickets, or review
 
 ---
 
-## 🧠 What Problem This Solves
+## What Problem This Solves
 
 `iostat` output is hard to interpret because:
 
 - Low latency does **not** always mean healthy
 - High queue depth often predicts future problems
-- Raw numbers don’t explain *severity*
-- Humans need interpretation, not metrics 
+- Raw numbers don't explain *severity*
+- Humans need interpretation, not metrics
 
 This tool:
 - Converts raw stats into a **single severity score**
@@ -64,36 +56,24 @@ This tool:
 
 ---
 
-## 🚀 Usage
+## Usage
 
-### Basic example - Parse and analyze immediately
-
+### Parse and analyze immediately
 ```bash
-# Generate iostat output
 iostat -x 2 3 > my-iostat.txt
-
-# Parse and generate report (combined command)
 python3 iostat-badness-analyzer.py all --input my-iostat.txt
-
-# Result files appear automatically:
-#   my-iostat.db (SQLite database)
-#   my-iostat-badness.txt (report)
 ```
 
-### Separate steps - Parse first, then report later
-
+### Separate steps
 ```bash
-# Step 1: Parse iostat to database
+# Parse
 python3 iostat-badness-analyzer.py parse --input iostat-output.txt
 
-# Step 2: Generate report from database
+# Report
 python3 iostat-badness-analyzer.py report --database iostat-output.db
-
-# The report outputs to: iostat-output-badness.txt
 ```
 
-### Generate report to custom file
-
+### Custom output file
 ```bash
 python3 iostat-badness-analyzer.py report \
   --database my-disk-data.db \
@@ -113,35 +93,17 @@ time                 device  write_kB_s  write_await_ms  read_kB_s  read_await_m
 
 ---
 
-## 🚨 Important Behavior
+## Key Features
 
-✔  Ignores noise  
-✔  Ignores sub-5ms latency  
-✔  Highlights overload early  
-✔  Works for SSD / NVMe / HDD  
-✔  No dependencies  
-✔  Safe for automation  
-
----
-
-## 📌 Why This Matters
-
-A disk can look “fine” while being overloaded.
-
-This tool catches:
-- Silent performance degradation
-- Queue buildup before latency explodes
-- Bottlenecks hidden by averages
-
----
-
-## ✅ Summary
-
-✔  Easy to run  
-✔  Easy to understand  
-✔  Explains problems clearly  
-✔  Suitable for reports, tickets, or monitoring  
-✔  Designed for real-world operations  
+- Ignores noise and sub-5ms latency
+- Highlights overload early
+- Works for SSD / NVMe / HDD
+- No dependencies
+- Safe for automation
+- Easy to run and understand
+- Explains problems clearly
+- Suitable for reports, tickets, or monitoring
+- Designed for real-world operations
 
 ---
 
