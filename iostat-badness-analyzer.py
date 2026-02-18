@@ -405,6 +405,8 @@ TS_RE = re.compile(r"^\s*(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}\s+[AP]M)\s*$")
 
 
 def parse_timestamp_to_iso8601(line: str) -> Optional[str]:
+    if "/" not in line:
+        return None
     m = TS_RE.match(line)
     if not m:
         return None
@@ -417,7 +419,6 @@ def parse_timestamp_to_iso8601(line: str) -> Optional[str]:
 
 HEADER_RE = re.compile(r"^\s*Device(?:\:)?\s+.+\S\s*$")
 CPU_HEADER_RE = re.compile(r"^\s*avg-cpu:\s*")
-BLANK_RE = re.compile(r"^\s*$")
 
 
 @dataclass
@@ -426,7 +427,6 @@ class IostatRecord:
     sample_ts: Optional[str]
     device: str
     metrics: Dict[str, Optional[float]]
-    raw_columns: Dict[str, str]
     header_fingerprint: str
 
 
@@ -498,7 +498,7 @@ def _split_device_sections(
         if header is None:
             continue
 
-        if BLANK_RE.match(line) or CPU_HEADER_RE.match(line):
+        if not line.strip() or CPU_HEADER_RE.match(line):
             flush()
             continue
 
@@ -533,7 +533,6 @@ def parse_iostat_lines(lines: Iterable[str]) -> Iterable[IostatRecord]:
 
         for row in rows:
             device = row[0]
-            raw_cols: Dict[str, str] = {}
             metrics: Dict[str, Optional[float]] = {}
 
             seen: Dict[str, int] = {}
@@ -541,7 +540,6 @@ def parse_iostat_lines(lines: Iterable[str]) -> Iterable[IostatRecord]:
             for i, raw_val in enumerate(row):
                 orig = orig_by_idx[i]
                 canon = canon_by_idx[i]
-                raw_cols[orig] = raw_val
 
                 if canon == "device":
                     continue
@@ -563,7 +561,6 @@ def parse_iostat_lines(lines: Iterable[str]) -> Iterable[IostatRecord]:
                 sample_ts=sample_ts,
                 device=device,
                 metrics=metrics,
-                raw_columns=raw_cols,
                 header_fingerprint=fingerprint,
             )
 
@@ -584,8 +581,7 @@ CREATE TABLE IF NOT EXISTS iostat_device_rows (
   sample_ts          TEXT,
   header_fingerprint TEXT NOT NULL,
   device             TEXT NOT NULL,
-  metrics_json       TEXT NOT NULL,
-  raw_columns_json   TEXT NOT NULL
+  metrics_json       TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_iostat_device_rows_source_sample_device
@@ -602,10 +598,12 @@ CREATE INDEX IF NOT EXISTS idx_iostat_device_rows_device
 def derive_output_db_path(input_path: Path) -> Path:
     name = input_path.name
     stem = input_path.stem
+    # Security: Sanitize filename to prevent path traversal
+    safe_stem = "".join(c for c in stem if c.isalnum() or c in ("-", "_", "."))
     if "iostat" in name.lower():
-        out_name = f"{stem}.db"
+        out_name = f"{safe_stem}.db"
     else:
-        out_name = f"{stem}-iostat.db"
+        out_name = f"{safe_stem}-iostat.db"
     return input_path.with_name(out_name)
 
 
@@ -616,59 +614,50 @@ def write_records_to_sqlite(
     batch_size: int = 1000,
 ) -> int:
     """Write records in batches; returns rows written."""
+    # Security: Validate output directory path
+    if not str(db_path).startswith("/") and ".." in str(db_path):
+        raise ValueError("Invalid output path - path traversal attempt detected")
+
+    # Security: Ensure the database path is within a safe directory
+    try:
+        safe_dir = db_path.resolve().parent
+        current_dir = Path.cwd().resolve()
+        if safe_dir != current_dir:
+            safe_dir.relative_to(current_dir)
+    except ValueError:
+        raise ValueError(
+            f"Database path {db_path} is outside the working directory - security restriction"
+        )
+
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     insert_sql = """
         INSERT INTO iostat_device_rows
-          (source_file, sample_id, sample_ts, header_fingerprint, device, metrics_json, raw_columns_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+          (source_file, sample_id, sample_ts, header_fingerprint, device, metrics_json)
+        VALUES (?, ?, ?, ?, ?, ?)
         """
 
     def record_values(
         batch: Iterable[IostatRecord],
-    ) -> List[Tuple[str, int, Optional[str], str, str, str, str]]:
-        """
-        Precompute JSON strings to avoid repeated serialization.
-
-        Args:
-            batch: List of IostatRecord objects
-
-        Returns:
-            List of tuples ready for database insertion
-        """
-        result = []
+    ) -> Iterable[Tuple[str, int, Optional[str], str, str, str]]:
         for r in batch:
-            # Only serialize if needed, avoid repeated operations
-            # The fingerprints are already pre-computed, we don't need to generate them again
-            metrics_json = json.dumps(r.metrics, sort_keys=True, separators=(",", ":"))
-            raw_columns_json = json.dumps(
-                r.raw_columns, sort_keys=True, separators=(",", ":")
+            yield (
+                source_file,
+                r.sample_id,
+                r.sample_ts,
+                r.header_fingerprint,
+                r.device,
+                json.dumps(r.metrics, separators=(",", ":")),
             )
-            result.append(
-                (
-                    r.source_file,
-                    r.sample_id,
-                    r.sample_ts,
-                    r.header_fingerprint,
-                    r.device,
-                    metrics_json,
-                    raw_columns_json,
-                )
-            )
-        return result
 
     total = 0
+    current_batch_size = max(100, min(5000, batch_size))  # Clamp between 100-5000
     with sqlite3.connect(str(db_path)) as conn:
         conn.executescript(SCHEMA_SQL)
         cur = conn.cursor()
         batch: List[IostatRecord] = []
         for record in records:
             batch.append(record)
-            # Dynamic batch sizing based on current batch size and memory considerations
-            # Use the batch_size parameter but allow for some optimizations
-            current_batch_size = max(
-                100, min(5000, batch_size)
-            )  # Clamp between 100-5000
             if len(batch) >= current_batch_size:
                 cur.executemany(insert_sql, record_values(batch))
                 total += len(batch)
@@ -697,6 +686,12 @@ def parse_iostat_file(in_path: Path, out_db: Path, batch_size: int = 1000) -> in
 
 
 def generate_report(db_path: Path, out_path: Path) -> int:
+    # Security: Validate paths before processing
+    if ".." in str(db_path):
+        raise ValueError(f"Invalid database path: {db_path}")
+    if ".." in str(out_path):
+        raise ValueError(f"Invalid output path: {out_path}")
+
     with sqlite3.connect(str(db_path)) as conn:
         cur = conn.cursor()
         cur.execute(REPORT_QUERY)
@@ -714,8 +709,15 @@ def parse_command(args: argparse.Namespace) -> int:
     if not in_path.exists() or not in_path.is_file():
         raise SystemExit(f"Input file not found: {in_path}")
 
+    # Security: Validate input path is not a directory traversal
+    if ".." in str(in_path):
+        raise SystemExit(f"Invalid input path: {in_path}")
+
     if args.output:
         out_db = Path(args.output).expanduser().resolve()
+        # Security: Ensure output path is not in parent directories
+        if ".." in str(out_db):
+            raise SystemExit(f"Invalid output path: {out_db}")
     else:
         out_db = derive_output_db_path(in_path)
 
@@ -740,11 +742,17 @@ def parse_command(args: argparse.Namespace) -> int:
 def report_command(args: argparse.Namespace) -> int:
     """Generate badness report from SQLite database."""
     db_path = Path(args.database).expanduser().resolve()
+    # Security: Validate database path
+    if ".." in str(db_path):
+        raise SystemExit(f"Invalid database path: {db_path}")
     if not db_path.exists():
         raise SystemExit(f"Database not found: {db_path}")
 
     if args.report_output:
         out_path = Path(args.report_output).expanduser().resolve()
+        # Security: Validate output path
+        if ".." in str(out_path):
+            raise SystemExit(f"Invalid output path: {out_path}")
     else:
         out_path = db_path.with_name(f"{db_path.stem}-badness.txt")
 
@@ -860,65 +868,6 @@ Examples:
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
         return 1
-
-    try:
-        if args.command == "parse":
-            return parse_command(args)
-        elif args.command == "report":
-            return report_command(args)
-        elif args.command == "all":
-            db_path = (
-                Path(args.db_output).expanduser().resolve()
-                if args.db_output
-                else derive_output_db_path(Path(args.input).expanduser().resolve())
-            )
-            # Make batch size configurable for all command
-            batch_size = getattr(args, "batch_size", 1000)
-            parse_iostat_file(
-                Path(args.input).expanduser().resolve(), db_path, batch_size
-            )
-            report_path = (
-                Path(args.report_output).expanduser().resolve()
-                if args.report_output
-                else db_path.with_name(f"{db_path.stem}-badness.txt")
-            )
-            generate_report(db_path, report_path)
-            print(f"Report generated: {report_path}")
-            return 0
-
-    except SystemExit as e:
-        return e.code
-    except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
-        return 1
-
-    try:
-        if args.command == "parse":
-            return parse_command(args)
-        elif args.command == "report":
-            return report_command(args)
-        elif args.command == "all":
-            db_path = (
-                Path(args.db_output).expanduser().resolve()
-                if args.db_output
-                else derive_output_db_path(Path(args.input).expanduser().resolve())
-            )
-            parse_iostat_file(Path(args.input).expanduser().resolve(), db_path)
-            report_path = (
-                Path(args.report_output).expanduser().resolve()
-                if args.report_output
-                else db_path.with_name(f"{db_path.stem}-badness.txt")
-            )
-            generate_report(db_path, report_path)
-            print(f"Report generated: {report_path}")
-            return 0
-
-    except SystemExit as e:
-        return e.code
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
